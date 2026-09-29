@@ -477,9 +477,8 @@ h1 .s { color: var(--torch); }
   const fullName = c => c.display || (c.first + " " + c.last);
   const canWrite = () => true;
 
-  // ---------- sync (ntfy.sh: every message is the whole board) ----------
-  const TOPIC = "s51-snake-draft-kb359-q7x4m2v9";
-  const NTFY = "https://ntfy.sh/" + TOPIC;
+  // ---------- sync (saved board, kept permanently) ----------
+  const API = "https://survivor-51-snake-draft.vercel.app/api/board";
 
   function commit(fn, opts = {}) {
     const next = fn(state);
@@ -496,8 +495,20 @@ h1 .s { color: var(--torch); }
   }
   async function publish(payload) {
     try {
-      const r = await fetch(NTFY, { method: "POST", body: JSON.stringify(payload) });
+      const r = await fetch(API, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        cache: "no-store"
+      });
+      if (r.status === 409) {
+        const m = await r.json();
+        receive(JSON.stringify(m), Date.now() / 1000);
+        setMode("live");
+        return;
+      }
       if (!r.ok) throw new Error(String(r.status));
+      setMode("live");
     } catch {
       toast("Couldn't reach the draft server. Check your connection and try again.");
       setMode("offline");
@@ -514,7 +525,6 @@ h1 .s { color: var(--torch); }
     const p = pending;
     if (p && m.nonce === p.nonce) pending = null;
     else if (p && m.rev >= p.rev) {
-      // Someone else's change landed first. Redo ours on top of theirs.
       pending = null;
       state = confirmed;
       const redone = p.tries < 3 && commit(p.fn, { tries: p.tries + 1, onLose: p.onLose });
@@ -845,28 +855,13 @@ h1 .s { color: var(--torch); }
   // ---------- boot ----------
   async function pollLatest() {
     try {
-      const r = await fetch(NTFY + "/json?poll=1&since=latest", { cache: "no-store" });
+      const r = await fetch(API, { cache: "no-store" });
       if (!r.ok) throw new Error(String(r.status));
-      const txt = await r.text();
-      let found = false;
-      txt.split("\n").forEach(line => {
-        if (!line.trim()) return;
-        try { const e = JSON.parse(line); if (e.event === "message") { found = true; receive(e.message, e.time); } } catch {}
-      });
+      const m = await r.json();
       setMode("live");
-      // ntfy keeps the last message for 12 hours; refresh it whenever someone visits.
-      if (found && !keptAlive && !pending && Date.now() / 1000 - lastMsgTime > 4 * 3600) { keptAlive = true; heal(); }
-      return found;
+      if (m && typeof m.rev === "number" && m.rev > 0) { receive(JSON.stringify(m), Date.now() / 1000); return true; }
+      return false;
     } catch { setMode("offline"); return null; }
-  }
-  function openStream() {
-    let es;
-    try { es = new EventSource(NTFY + "/sse"); } catch { return; }
-    es.onopen = () => { pollLatest(); };
-    es.onmessage = ev => {
-      try { const e = JSON.parse(ev.data); if (e.event === "message") receive(e.message, e.time); } catch {}
-    };
-    es.onerror = () => { if (mode === "live") setMode("connecting"); };
   }
   async function boot() {
     let local = blank();
@@ -875,14 +870,10 @@ h1 .s { color: var(--torch); }
     renderSync();
     render();
     const found = await pollLatest();
-    if (found === false) {
-      if (local.players.length || local.picks.length) {
-        // The server copy expired; this device still has the board, so put it back.
-        publish({ ...local, rev: local.rev + 1, nonce: uid() + uid() });
-      } else { state = confirmed; render(); }
+    if (found === false && (local.players.length || local.picks.length)) {
+      publish({ ...local, rev: Math.max(local.rev, 0) + 1, nonce: uid() + uid() });
     }
-    openStream();
-    setInterval(pollLatest, 15000);
+    setInterval(pollLatest, 4000);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) pollLatest(); });
   }
   boot();
